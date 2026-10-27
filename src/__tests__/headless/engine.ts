@@ -418,6 +418,38 @@ describe('tween isRunning tracks the real chain state', () => {
 	);
 
 	test(
+		'a showcased-icon alpha pulse breathes over seconds instead of strobing',
+		async () => {
+			const match = await boot();
+			const engine = new Phaser4Engine(match.game, match.scene);
+			const sprite = match.scene.add.sprite(0, 0, '__DEFAULT');
+			sprite.alpha = 1;
+
+			// The shape CreatureSprite.startShowcaseIconFlicker builds: one step,
+			// auto-started, then yoyo and infinite repeat. Those two calls rebuild
+			// the chain; if the repeat landed on a short fade instead, half a
+			// second would already have bottomed out and come back.
+			engine.tween(sprite).to({ alpha: 0.25 }, 2000, undefined, true).yoyo(true).repeat(-1);
+
+			// ~0.2s into a 2s leg. A 250ms strobe would already be near 25%.
+			match.stepFrames(12);
+			expect(sprite.alpha).toBeGreaterThan(0.8);
+			expect(sprite.alpha).toBeLessThan(1);
+
+			// ~2s: the dim end. A short yoyo would have returned to full opacity
+			// after an even number of legs.
+			match.stepFrames(113);
+			expect(sprite.alpha).toBeLessThan(0.4);
+
+			// Heading back toward opaque, so the yoyo actually turned around.
+			const dimmest = sprite.alpha;
+			match.stepFrames(40);
+			expect(sprite.alpha).toBeGreaterThan(dimmest);
+		},
+		BOOT_TIMEOUT,
+	);
+
+	test(
 		'onUpdateCallback fires every frame, not just on the chain that was current at registration',
 		async () => {
 			const match = await boot();
