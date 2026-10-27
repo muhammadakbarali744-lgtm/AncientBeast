@@ -2793,7 +2793,7 @@ export class Creature {
 }
 
 /**
- * Per-hint bookkeeping: the type tag and the three tweens that drive it.
+ * Per-hint bookkeeping: the type tag and the tweens that drive it.
  *
  * Phaser 2 CE gave every game object a `DataManager` and this subsystem hung
  * all of its state off `hint.data.*`. Phaser 4 has no equivalent, and the
@@ -2808,11 +2808,30 @@ type HintState = {
 	tweenAlpha: TweenHandle | null;
 	tweenPos: TweenHandle | null;
 	tweenBounce: TweenHandle | null;
+	/**
+	 * Opacity ping-pong on a showcased icon. Kept off {@link tweenAlpha} so a
+	 * fade-in can finish and hand off, and so retagging the hint does not
+	 * restart the pulse.
+	 */
+	tweenFlicker: TweenHandle | null;
 	/** Resting y, captured on first bounce so a stop returns the hint to it. */
 	baseY?: number;
 	/** `confirm` hints that must not animate into place, e.g. skip turn. */
 	skipTurnStatic: boolean;
 };
+
+/**
+ * Dim end of a showcased icon's opacity pulse (#2539). The bright end is fully
+ * opaque, so the icon breathes between these two rather than blinking off.
+ */
+const SHOWCASE_ICON_DIM_ALPHA = 0.25;
+
+/**
+ * One leg of that pulse. A shorter loop reads as a strobe — an earlier attempt
+ * at half a second was rejected as too fast, and chaining the pulse onto the
+ * fade-in made the short fade the thing that looped.
+ */
+const SHOWCASE_ICON_FLICKER_MS = 2000;
 
 const hintStates = new WeakMap<object, HintState>();
 
@@ -2825,8 +2844,8 @@ function peekHintState(hint: object): HintState | undefined {
  * Reads the state for a hint element, registering a blank one on first use.
  *
  * Every hint element the code creates is registered as it is built, so this
- * only ever fills in for the two paths that deliberately clear all three
- * tweens at once: `hint()` and the skip-turn confirm branch.
+ * only ever fills in for the two paths that deliberately clear the tweens at
+ * once: `hint()` and the skip-turn confirm branch.
  */
 function hintState(hint: object): HintState {
 	let state = hintStates.get(hint);
@@ -2836,6 +2855,7 @@ function hintState(hint: object): HintState {
 			tweenAlpha: null,
 			tweenPos: null,
 			tweenBounce: null,
+			tweenFlicker: null,
 			skipTurnStatic: false,
 		};
 		hintStates.set(hint, state);
@@ -4107,6 +4127,89 @@ class CreatureSprite {
 		this._noActionHintGroup = null;
 	}
 
+	/**
+	 * Ping-pong a showcased icon between full opacity and 25%.
+	 *
+	 * The loop is its own tween, not a second step on the fade-in. The engine
+	 * adapter copies `yoyo` and `repeat` onto every step of a chain, so an
+	 * infinite repeat on a short fade-in would loop that fade forever and this
+	 * slow step would never play — which is what made the earlier flicker strobe.
+	 * A pulse that is already running is left alone so hover retags don't snap
+	 * the icon back to full opacity.
+	 */
+	private startShowcaseIconFlicker(icon: SpriteHandle) {
+		const state = hintState(icon);
+		if (state.tweenFlicker?.isRunning) {
+			return;
+		}
+
+		state.tweenFlicker?.stop();
+		icon.alpha = 1;
+		state.tweenFlicker = this._gameEngine
+			.tween(icon)
+			.to(
+				{ alpha: SHOWCASE_ICON_DIM_ALPHA },
+				SHOWCASE_ICON_FLICKER_MS,
+				Easing.Quadratic.InOut,
+				true,
+			)
+			.yoyo(true)
+			.repeat(-1);
+	}
+
+	private stopShowcaseIconFlicker(hint: SpriteHandle) {
+		const state = peekHintState(hint);
+		if (!state?.tweenFlicker) {
+			return;
+		}
+
+		state.tweenFlicker.stop();
+		state.tweenFlicker = null;
+	}
+
+	/**
+	 * Fade a showcased icon in, then let it breathe. The hand-off is skipped
+	 * when the fade was replaced (the hint was cleared or retagged first).
+	 */
+	private fadeInShowcaseIcon(icon: SpriteHandle, duration: number, easing: (k: number) => number) {
+		const fade = this._gameEngine.tween(icon).to({ alpha: 1 }, duration, easing).start();
+		hintState(icon).tweenAlpha = fade;
+		fade.onComplete.add(() => {
+			const state = peekHintState(icon);
+			if (
+				!icon.active ||
+				!state ||
+				state.hintType === 'confirm_deleted' ||
+				state.tweenAlpha !== fade
+			) {
+				return;
+			}
+
+			state.tweenAlpha = null;
+			this.startShowcaseIconFlicker(icon);
+		});
+	}
+
+	/**
+	 * Cancel an in-flight fade. A skip icon keeps its pulse; the frame and the
+	 * label snap to opaque so only the icon flickers.
+	 */
+	private settleHintAlpha(hint: SpriteHandle) {
+		const state = hintState(hint);
+		if (state.tweenAlpha) {
+			state.tweenAlpha.stop();
+			state.tweenAlpha = null;
+		}
+
+		if (hint.key === 'skip') {
+			this.startShowcaseIconFlicker(hint);
+			return;
+		}
+
+		this.stopShowcaseIconFlicker(hint);
+		hint.alpha = 1;
+	}
+
 	hint(text: string, hintType: CreatureHintType) {
 		const tooltipSpeed = 250;
 		const tooltipDisplaySpeed = 500;
@@ -4218,11 +4321,7 @@ class CreatureSprite {
 						hintState(hint).tweenPos.stop();
 						hintState(hint).tweenPos = null;
 					}
-					if (hintState(hint).tweenAlpha) {
-						hintState(hint).tweenAlpha.stop();
-						hintState(hint).tweenAlpha = null;
-					}
-					hint.alpha = 1;
+					this.settleHintAlpha(hint);
 					hintState(hint).hintType = 'confirm';
 					hintState(hint).skipTurnStatic = true;
 				});
@@ -4249,11 +4348,7 @@ class CreatureSprite {
 						hintState(hint).tweenPos.stop();
 						hintState(hint).tweenPos = null;
 					}
-					if (hintState(hint).tweenAlpha) {
-						hintState(hint).tweenAlpha.stop();
-						hintState(hint).tweenAlpha = null;
-					}
-					hint.alpha = 1;
+					this.settleHintAlpha(hint);
 
 					// Phaser 4 replaced `instanceof Phaser.Text` with the native
 					// game object `type`, which the engine handle forwards.
@@ -4325,10 +4420,8 @@ class CreatureSprite {
 			hintState(noActionIcon).tweenAlpha = null;
 			hintState(noActionIcon).tweenPos = null;
 			hintState(noActionIcon).tweenBounce = null;
-			this._gameEngine
-				.tween(noActionIcon)
-				.to({ alpha: 1 }, tooltipSpeed, tooltipTransition)
-				.start();
+			hintState(noActionIcon).tweenFlicker = null;
+			this.fadeInShowcaseIcon(noActionIcon, tooltipSpeed, tooltipTransition);
 			this._enableSkipTurnInput(noActionIcon);
 
 			const noActionText = this._gameEngine.add.text(0, 50, text, style, this._hintGrp);
@@ -4391,6 +4484,12 @@ class CreatureSprite {
 			}
 
 			state.hintType = 'confirm_deleted';
+			// Stop the fade-in before the fade-out, or the two tweens fight over
+			// alpha. The pulse is a different tween and has to be stopped too.
+			if (state.tweenAlpha) {
+				state.tweenAlpha.stop();
+			}
+			this.stopShowcaseIconFlicker(hint);
 			state.tweenAlpha = this._gameEngine
 				.tween(hint)
 				.to({ alpha: 0 }, 100, tooltipTransition)
@@ -4477,12 +4576,14 @@ class CreatureSprite {
 			hintState(skipTurnIcon).tweenAlpha = null;
 			hintState(skipTurnIcon).tweenPos = null;
 			hintState(skipTurnIcon).tweenBounce = null;
+			hintState(skipTurnIcon).tweenFlicker = null;
 			hintState(skipTurnIcon).skipTurnStatic = isSkipTurnConfirm;
-			if (!isSkipTurnConfirm) {
-				this._gameEngine
-					.tween(skipTurnIcon)
-					.to({ alpha: 1 }, tooltipSpeed, tooltipTransition)
-					.start();
+			if (isSkipTurnConfirm) {
+				// Already opaque: start the pulse immediately. A fade-in here would
+				// be the step that looped if the pulse were chained onto it.
+				this.startShowcaseIconFlicker(skipTurnIcon);
+			} else {
+				this.fadeInShowcaseIcon(skipTurnIcon, tooltipSpeed, tooltipTransition);
 			}
 			this._enableSkipTurnInput(skipTurnIcon);
 		}
@@ -4585,6 +4686,7 @@ class CreatureSprite {
 				hintState(hint).tweenAlpha.stop();
 				hintState(hint).tweenAlpha = null;
 			}
+			this.stopShowcaseIconFlicker(hint);
 
 			const targetY = hint.y - 30;
 			hintState(hint).tweenPos = this._gameEngine
@@ -4658,6 +4760,7 @@ class CreatureSprite {
 			if (state.tweenAlpha) {
 				state.tweenAlpha.stop();
 			}
+			this.stopShowcaseIconFlicker(hint);
 			state.tweenAlpha = this._gameEngine
 				.tween(hint)
 				.to({ alpha: 0 }, 100, tooltipTransition)

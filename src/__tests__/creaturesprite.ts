@@ -224,7 +224,17 @@ function createEngineMock(resident: Map<string, { width: number; height: number 
 		return group;
 	};
 
+	const tweenLog: Array<{
+		target: any;
+		steps: Array<{ props: Record<string, number>; duration: number }>;
+		yoyo: boolean;
+		repeat: number | null;
+		stopped: boolean;
+		completeCallbacks: Array<() => void>;
+	}> = [];
+
 	return {
+		tweenLog,
 		groups: { creatureGroup: createGroup() },
 		add: {
 			group: (parent?: any) => createGroup(parent),
@@ -256,25 +266,64 @@ function createEngineMock(resident: Map<string, { width: number; height: number 
 		 *
 		 * `hint()` chains `.to().to().start()`, yoyos, and hooks both
 		 * `onUpdateCallback` and `onComplete.add`, so every link has to return the
-		 * tween rather than undefined. The callbacks are never fired: these tests
-		 * assert on what `hint()` *builds*, not on the animation it would play.
+		 * tween rather than undefined. The callbacks are stored and not fired:
+		 * these tests assert on what `hint()` *builds*, and a test that cares
+		 * about the hand-off invokes the stored completion itself.
+		 *
+		 * `to(..., autoStart)` marks the tween running, matching the engine
+		 * adapter, so a second `startShowcaseIconFlicker` can see the pulse and
+		 * leave it alone.
 		 */
-		tween: (_target?: unknown) => {
+		tween: (target?: unknown) => {
+			const record = {
+				target,
+				steps: [] as Array<{ props: Record<string, number>; duration: number }>,
+				yoyo: false,
+				repeat: null as number | null,
+				stopped: false,
+				completeCallbacks: [] as Array<() => void>,
+			};
+			tweenLog.push(record);
 			const tween: any = {
 				isRunning: false,
 				isDestroyed: false,
-				stop: () => tween,
+				stop: () => {
+					tween.isRunning = false;
+					record.stopped = true;
+					return tween;
+				},
 				pause: () => tween,
 				play: () => tween,
-				yoyo: () => tween,
-				repeat: () => tween,
+				yoyo: (enable = true) => {
+					record.yoyo = enable;
+					return tween;
+				},
+				repeat: (count = 1) => {
+					record.repeat = count;
+					return tween;
+				},
 				delay: () => tween,
 				onUpdateCallback: () => tween,
-				onComplete: { add: () => undefined },
+				onComplete: {
+					add: (cb: () => void) => {
+						record.completeCallbacks.push(cb);
+					},
+				},
 				onStart: { add: () => undefined },
 				onStop: { add: () => undefined },
 			};
-			tween.to = () => tween;
+			tween.to = (
+				props: Record<string, number>,
+				duration: number,
+				_easing?: unknown,
+				autoStart = false,
+			) => {
+				record.steps.push({ props, duration });
+				if (autoStart) {
+					tween.isRunning = true;
+				}
+				return tween;
+			};
 			tween.start = () => {
 				tween.isRunning = true;
 				return tween;
@@ -554,5 +603,83 @@ describe('CreatureSprite hint backdrop', () => {
 
 		const survivors = hintGroup(creature).children.filter((sprite: any) => sprite.exists !== false);
 		expect(survivors.every((sprite: any) => sprite.key !== 'frame')).toBe(true);
+	});
+
+	/** The opacity pulse on the hourglass, and only that. */
+	const iconFlickers = () =>
+		engine.tweenLog.filter(
+			(entry) =>
+				entry.target?.key === 'skip' && entry.steps.some((step) => step.props.alpha === 0.25),
+		);
+
+	test('the skip-turn icon ping-pongs between full and 25% opacity', () => {
+		// #2539: the icon showcased over a unit with nothing left to do breathes
+		// between those two opacities. The pulse is its own tween — one step,
+		// yoyo, forever — because folding it into the fade-in makes the adapter
+		// loop the short fade instead, which is the strobe this replaces.
+		// @ts-expect-error partial Creature options
+		const creature = new Creature(getCreatureObjMock(), game);
+		creature.creatureSprite.hint('Skip turn', 'confirm');
+
+		const flickers = iconFlickers();
+		expect(flickers).toHaveLength(1);
+		expect(flickers[0].steps).toEqual([{ props: { alpha: 0.25 }, duration: 2000 }]);
+		expect(flickers[0].yoyo).toBe(true);
+		expect(flickers[0].repeat).toBe(-1);
+		expect(flickers[0].stopped).toBe(false);
+
+		const framePulsed = engine.tweenLog.some(
+			(entry) =>
+				entry.target?.key !== 'skip' && entry.steps.some((step) => step.props.alpha === 0.25),
+		);
+		expect(framePulsed).toBe(false);
+	});
+
+	test('hovering the same hint keeps the pulse instead of restarting it', () => {
+		// The hover path retags the confirm marker as a no-action hint and used
+		// to stop every alpha tween and snap alpha back to 1. That would chop
+		// the pulse on every hex the cursor crossed.
+		// @ts-expect-error partial Creature options
+		const creature = new Creature(getCreatureObjMock(), game);
+		creature.creatureSprite.hint('Skip turn', 'confirm');
+		const flicker = iconFlickers()[0];
+
+		creature.creatureSprite.hint('Skip turn', 'no_action');
+
+		expect(iconFlickers()).toEqual([flicker]);
+		expect(flicker.stopped).toBe(false);
+	});
+
+	test('a hint built on hover fades the icon in before the pulse starts', () => {
+		// @ts-expect-error partial Creature options
+		const creature = new Creature(getCreatureObjMock(), game);
+		creature.creatureSprite.hint('Skip turn', 'no_action');
+
+		expect(iconFlickers()).toHaveLength(0);
+		const fade = engine.tweenLog.find(
+			(entry) => entry.target?.key === 'skip' && entry.steps.some((step) => step.props.alpha === 1),
+		);
+		expect(fade?.completeCallbacks.length).toBe(1);
+
+		fade?.completeCallbacks.forEach((cb) => cb());
+
+		expect(iconFlickers()).toHaveLength(1);
+		expect(
+			engine.tweenLog.some(
+				(entry) =>
+					entry.target?.key !== 'skip' && entry.steps.some((step) => step.props.alpha === 0.25),
+			),
+		).toBe(false);
+	});
+
+	test('clearing the hint stops the pulse so the fade-out is the only alpha tween', () => {
+		// @ts-expect-error partial Creature options
+		const creature = new Creature(getCreatureObjMock(), game);
+		creature.creatureSprite.hint('Skip turn', 'confirm');
+		const flicker = iconFlickers()[0];
+
+		creature.creatureSprite.clearHints(['confirm']);
+
+		expect(flicker.stopped).toBe(true);
 	});
 });
